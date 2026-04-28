@@ -19,13 +19,7 @@ from tqdm import tqdm
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DEFAULT_REF_TEXT = (
-    "Даже если семья, даже если стоят за него, как стены, все знакомые, друзья — "
-    "не прощайте ему измен, никогда не прощайте измены. Даже самым любимым женам, "
-    "пусть тяжело, пусть даже словом попробует или делом она оправдываться снова — "
-    "не прощайте вы ей измены, никогда не прощайте измены ни любимым друзьям, "
-    "ни любимым супругам — только разлука избавит."
-)
+DEFAULT_REF_TEXT = "Даже если семья даже если стоят за него как стены все знакомые друзья не прощайте ему измен никогда не прощайте измены даже самым любимым женам пусть тяжело пусть даже словом попробует или делом она оправдываться снова не прощайте вы ей измены"
 
 
 def numbers_to_russian_words(text):
@@ -112,7 +106,7 @@ def wav_to_opus(wav_path, opus_path, bitrate=48):
     cmd = [
         'ffmpeg', '-y', '-i', wav_path,
         '-c:a', 'libopus', '-b:a', f'{bitrate}k',
-        '-ac', '1', '-application', 'voip',
+        '-ac', '1', '-application', 'audio',
         opus_path
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -169,7 +163,7 @@ def process_file(cosyvoice, md_path, output_dir, ref_text, ref_wav, bitrate, pro
     chunks = []
     current = ""
     for s in sentences:
-        if current and len(current) + len(s) + 1 > 300:
+        if current and len(current) + len(s) + 1 > 500:
             chunks.append(current)
             current = s
         else:
@@ -314,7 +308,7 @@ def main():
 
     # Prepare ref audio
     print(f"Preparing ref audio: {args.ref_wav}")
-    ref_wav = trim_ref_audio(args.ref_wav)
+    ref_wav = trim_ref_audio(args.ref_wav, max_sec=22)
 
     # Load model
     print(f"Loading CosyVoice model...")

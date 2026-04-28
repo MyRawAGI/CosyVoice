@@ -337,8 +337,18 @@ class CosyVoice3(CosyVoice2):
                 if tid < n_vocab:
                     logits[tid] = -np.inf
 
-        # No temperature — match PyTorch which uses raw log_softmax + softmax
+        # Repetition penalty: penalize tokens repeated 3+ times
+        if decoded_tokens is not None:
+            from collections import Counter
+            counts = Counter(decoded_tokens)
+            for tid, count in counts.items():
+                if count >= 3 and tid < n_vocab:
+                    logits[tid] /= 1.4
+
+        # Temperature: reduced for first 15 tokens for stable generation start
+        effective_temp = self.llm_temperature * 0.3 if (decoded_tokens is not None and len(decoded_tokens) < 15) else self.llm_temperature
         logits -= logits[valid].max()
+        logits /= effective_temp
         probs = np.exp(logits)
         probs /= probs.sum()
 
