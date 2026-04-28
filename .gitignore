@@ -50,3 +50,13 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+# User work folders
+novel/
+audio/
+
+# GGUF models
+*.gguf
+
+# Claude Code
+.claude/
