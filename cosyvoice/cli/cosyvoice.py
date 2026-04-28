@@ -86,7 +86,7 @@ class CosyVoice:
             logging.info('synthesis text {}'.format(i))
             for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                 yield model_output
                 start_time = time.time()
 
@@ -100,7 +100,7 @@ class CosyVoice:
             logging.info('synthesis text {}'.format(i))
             for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                 yield model_output
                 start_time = time.time()
 
@@ -111,7 +111,7 @@ class CosyVoice:
             logging.info('synthesis text {}'.format(i))
             for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                 yield model_output
                 start_time = time.time()
 
@@ -124,7 +124,7 @@ class CosyVoice:
             logging.info('synthesis text {}'.format(i))
             for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                 yield model_output
                 start_time = time.time()
 
@@ -133,7 +133,7 @@ class CosyVoice:
         start_time = time.time()
         for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
             speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-            logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+            logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
             yield model_output
             start_time = time.time()
 
@@ -183,7 +183,7 @@ class CosyVoice2(CosyVoice):
             logging.info('synthesis text {}'.format(i))
             for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                 yield model_output
                 start_time = time.time()
 
@@ -275,6 +275,19 @@ class CosyVoice3(CosyVoice2):
         self.sos_speech_idx = self.base_speech_token_size + 0    # 6561
         self.eos_speech_idx = self.base_speech_token_size + 1    # 6562
         self.task_id_speech_idx = self.base_speech_token_size + 2  # 6563
+        # Match PyTorch: stop_token_ids = [speech_token_size + i for i in range(200)]
+        self.stop_token_ids = set(
+            self.speech_token_offset + self.base_speech_token_size + i
+            for i in range(self.embedding_size - self.base_speech_token_size)
+        )
+        # min/max token-to-text ratios (matching PyTorch training defaults)
+        self.min_token_text_ratio = 2
+        self.max_token_text_ratio = 20
+        # Repetition-aware sampling parameters (matching ras_sampling in PyTorch)
+        self.ras_top_p = 0.8
+        self.ras_top_k = 25
+        self.ras_win_size = 10
+        self.ras_tau_r = 0.1
 
     def _load_llama_cpp(self, gguf_model_path):
         """Load GGUF model via llama-cpp-python."""
@@ -297,29 +310,39 @@ class CosyVoice3(CosyVoice2):
 
         self._llama_cpp_loaded = True
 
-    def _sample_speech_token_constrained(self, logit_pos):
-        """Sample next token constrained to speech tokens + EOS only.
+    def _sample_speech_token_constrained(self, logit_pos, allow_stop=True, decoded_tokens=None):
+        """Sample next token constrained to speech tokens + optionally stop tokens.
 
         Uses manual logit extraction at the correct position.
-        Fallback when built-in sample() produces text tokens.
+        Matches PyTorch sampling_ids behavior with ignore_eos support.
         """
         logits = np.array(self.llm_gguf.scores[logit_pos], dtype=np.float32)
         n_vocab = len(logits)
 
-        # Mask: only allow speech tokens [offset, offset+base_size) and EOS
+        # Mask: only allow speech tokens [offset, offset+base_size)
         valid = np.full(n_vocab, False)
         s = self.speech_token_offset
         e = min(s + self.base_speech_token_size, n_vocab)
         valid[s:e] = True
-        if self.eos_token_id < n_vocab:
-            valid[self.eos_token_id] = True
+        # Optionally allow stop tokens (matching PyTorch stop_token_ids)
+        if allow_stop:
+            for tid in self.stop_token_ids:
+                if tid < n_vocab:
+                    valid[tid] = True
         logits[~valid] = -np.inf
 
-        logits = logits / max(self.llm_temperature, 1e-8)
+        # Suppress EOS/stop tokens before min_len
+        if not allow_stop:
+            for tid in self.stop_token_ids:
+                if tid < n_vocab:
+                    logits[tid] = -np.inf
+
+        # No temperature — match PyTorch which uses raw log_softmax + softmax
         logits -= logits[valid].max()
         probs = np.exp(logits)
         probs /= probs.sum()
 
+        # Nucleus sampling: top_p=0.8, top_k=25 (matching PyTorch ras_sampling)
         if self.llm_top_k > 0:
             top_k = min(self.llm_top_k, int(np.sum(probs > 0)))
             if top_k > 0:
@@ -349,6 +372,7 @@ class CosyVoice3(CosyVoice2):
 
         Uses pre-tokenized IDs from the CosyVoice frontend (same as PyTorch path).
         Format: [SOS] + prompt_text_ids + text_ids + [TASK_ID] + offset(prompt_speech_tokens)
+        Matches PyTorch behavior: min_len/max_len enforcement, ignore_eos before min_len.
         """
         all_text_ids = prompt_text_token_ids + text_token_ids
         prompt_speech_ids = [self.speech_token_offset + t for t in prompt_speech_tokens]
@@ -357,31 +381,33 @@ class CosyVoice3(CosyVoice2):
         self.llm_gguf.reset()
         self.llm_gguf.eval(input_ids)
 
-        # Track position for constrained sampling fallback
         n_past = len(input_ids)
 
+        # Match PyTorch: min_len/max_len based on text token count
+        text_only_len = len(text_token_ids)
+        min_len = max(int(text_only_len * self.min_token_text_ratio), 1)
+        max_len = min(int(text_only_len * self.max_token_text_ratio), 2048)
+
         speech_tokens = []
-        raw_generated = []
-        max_new_tokens = 2048
+        decoded_tokens = []
 
-        for i in range(max_new_tokens):
-            # Use built-in sample() (position-aware, like FastCosyVoice)
-            next_token_id = self.llm_gguf.sample()
+        for i in range(max_len):
+            # Suppress stop tokens until min_len reached (matches ignore_eos in PyTorch)
+            allow_stop = i >= min_len
+            next_token_id = self._sample_speech_token_constrained(
+                logit_pos=n_past - 1, allow_stop=allow_stop, decoded_tokens=decoded_tokens
+            )
 
-            # If built-in sample returns text token, retry with constrained sampling
-            if (next_token_id != self.eos_token_id and
-                not (self.speech_token_offset <= next_token_id < self.speech_token_offset + self.base_speech_token_size)):
-                if i == 0:
-                    logging.info('Built-in sample() returned text token {} on step 0, switching to constrained'.format(next_token_id))
-                next_token_id = self._sample_speech_token_constrained(logit_pos=n_past - 1)
-
-            raw_generated.append(next_token_id)
-
-            if next_token_id == self.eos_token_id:
-                break
+            # Check stop tokens
+            if next_token_id in self.stop_token_ids:
+                if allow_stop:
+                    break
+                else:
+                    continue
 
             if self.speech_token_offset <= next_token_id < self.speech_token_offset + self.base_speech_token_size:
                 speech_tokens.append(next_token_id - self.speech_token_offset)
+                decoded_tokens.append(next_token_id)
             else:
                 break
 
@@ -465,7 +491,7 @@ class CosyVoice3(CosyVoice2):
                     **{k: v for k, v in model_input.items() if k.startswith('flow') or k.startswith('prompt_speech')}
                 ):
                     speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                    logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                    logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                     yield model_output
                     start_time = time.time()
 
@@ -482,7 +508,7 @@ class CosyVoice3(CosyVoice2):
                     **{k: v for k, v in model_input.items() if k.startswith('flow') or k.startswith('prompt_speech')}
                 )
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                 yield model_output
 
     def inference_cross_lingual(self, tts_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
@@ -520,7 +546,7 @@ class CosyVoice3(CosyVoice2):
                     **{k: v for k, v in model_input.items() if k.startswith('flow') or k.startswith('prompt_speech')}
                 ):
                     speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                    logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                    logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                     yield model_output
                     start_time = time.time()
 
@@ -537,7 +563,7 @@ class CosyVoice3(CosyVoice2):
                     **{k: v for k, v in model_input.items() if k.startswith('flow') or k.startswith('prompt_speech')}
                 )
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                 yield model_output
 
     def inference_instruct2(self, tts_text, instruct_text, prompt_wav, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
@@ -575,7 +601,7 @@ class CosyVoice3(CosyVoice2):
                     **{k: v for k, v in model_input.items() if k.startswith('flow') or k.startswith('prompt_speech')}
                 ):
                     speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                    logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                    logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                     yield model_output
                     start_time = time.time()
 
@@ -592,7 +618,7 @@ class CosyVoice3(CosyVoice2):
                     **{k: v for k, v in model_input.items() if k.startswith('flow') or k.startswith('prompt_speech')}
                 )
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len if speech_len > 0 else 0))
                 yield model_output
 
 def AutoModel(**kwargs):
