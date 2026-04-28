@@ -280,3 +280,64 @@ You can also scan the QR code to join our official Dingding chat group.
 
 ## Disclaimer
 The content provided above is for academic purposes only and is intended to demonstrate technical capabilities. Some examples are sourced from the internet. If any content infringes on your rights, please contact us to request its removal.
+
+---
+
+## About This Fork
+
+This fork extends CosyVoice3 with a **llama.cpp backend** and a **novel-to-audiobook pipeline**, based on [PR #1872](https://github.com/FunAudioLLM/CosyVoice/pull/1872) by Ferraronp.
+
+### What's changed
+
+**llama.cpp backend fixes** (`cosyvoice/cli/cosyvoice.py`):
+- EOS suppression — the original backend produced EOS on step 0; now all 200 stop tokens are blocked until `min_len` (text_tokens * 2) is reached, matching PyTorch `ignore_eos` behavior
+- No-temperature sampling — raw softmax matching PyTorch `nucleus_sampling`, fixes Russian quality
+- `min_len` / `max_len` enforcement from token-to-text ratios (2x / 20x), matching the PyTorch training defaults
+- ZeroDivisionError fix for empty speech output
+
+**Novel TTS pipeline** (`novel_tts.py`):
+- Reads `.md` files from `novel/`, converts to Opus audiobooks in `audio/`
+- Zero-shot voice cloning via `ref_voice.wav` + transcription
+- Russian number-to-words conversion (num2words)
+- Progress tracking with resume (`audio/progress.json`)
+- Crossfade (30ms) between chunks for smooth boundaries
+- ffmpeg-based WAV concatenation and Opus encoding (48kbps, mono, VOIP optimization)
+
+**Run script** (`run_tts.bat`):
+- One-click launch: activates conda env, sets ffmpeg PATH, runs the pipeline
+
+### Quick start
+
+```bash
+pip install llama-cpp-python num2words
+```
+
+Download a GGUF model from [Ferraronp/CosyVoice3-qwen2.5-0.5b-speech-gguf](https://huggingface.co/Ferraronp/CosyVoice3-qwen2.5-0.5b-speech-gguf) (F16 recommended).
+
+```python
+# Use as a library
+from cosyvoice.cli.cosyvoice import AutoModel
+
+cosyvoice = AutoModel(
+    model_dir='pretrained_models/Fun-CosyVoice3-0.5B',
+    load_llama_cpp=True,
+    gguf_model_path='cosyvoice_llm_f32.gguf',
+)
+
+for output in cosyvoice.inference_zero_shot(
+    tts_text='Привет! Это тест.',
+    prompt_text='Транскрипция вашего референсного аудио...',
+    prompt_wav='ref_voice.wav',
+):
+    audio = output['tts_speech']
+```
+
+```bash
+# Generate audiobooks from markdown novels
+python novel_tts.py
+# or just double-click run_tts.bat
+```
+
+### Branch
+
+All changes are on the `llama-cpp-fixes` branch.
