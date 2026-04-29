@@ -154,22 +154,68 @@ def process_file(cosyvoice, md_path, output_dir, ref_text, ref_wav, bitrate, pro
         print(f"  Empty text, skipping")
         return
 
-    # Split text by sentences — CosyVoice frontend does its own splitting,
-    # but we pre-split to keep chunks small enough for reliable generation
-    sentences = re.split(r'(?<=[.!?…])\s+', clean_text)
-    sentences = [s.strip() for s in sentences if s.strip()]
+    # Hierarchical text splitting: paragraph → sentence → ; → comma+conjunction → comma
+    def _subsplit(segment):
+        """Sub-split an oversized segment using progressively weaker boundaries."""
+        if len(segment) <= 500:
+            return [segment]
+        if ';' in segment:
+            parts = [p.strip() for p in segment.split(';') if p.strip()]
+            if len(parts) > 1:
+                result = []
+                for p in parts:
+                    result.extend(_subsplit(p))
+                return result
+        parts = re.split(r',\s*(?=(?:а|но|и|или|что|как|когда|где|если)\b)', segment)
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) > 1:
+            result = []
+            for p in parts:
+                result.extend(_subsplit(p))
+            return result
+        if ',' in segment:
+            parts = [p.strip() for p in segment.split(',') if p.strip()]
+            if len(parts) > 1:
+                return parts
+        return [segment]
 
-    # Group sentences into chunks of ~200-300 chars (safe for CosyVoice)
+    paragraphs = re.split(r'\n\n+', clean_text)
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
     chunks = []
-    current = ""
-    for s in sentences:
-        if current and len(current) + len(s) + 1 > 500:
+    for para in paragraphs:
+        sentences = re.split(r'(?<=[.!?…])\s+', para)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        current = ""
+        for s in sentences:
+            subs = _subsplit(s) if len(s) > 500 else [s]
+            for sub in subs:
+                if current and len(current) + len(sub) + 1 > 500:
+                    chunks.append(current)
+                    current = sub
+                else:
+                    current = (current + " " + sub).strip() if current else sub
+        if current:
             chunks.append(current)
-            current = s
+
+    # Merge chunks shorter than 150 chars with neighbour
+    merged = []
+    i = 0
+    while i < len(chunks):
+        if len(chunks[i]) < 150:
+            if i + 1 < len(chunks):
+                chunks[i + 1] = chunks[i] + " " + chunks[i + 1]
+                i += 1
+            elif merged:
+                merged[-1] = merged[-1] + " " + chunks[i]
+                i += 1
+            else:
+                merged.append(chunks[i])
+                i += 1
         else:
-            current = (current + " " + s).strip() if current else s
-    if current:
-        chunks.append(current)
+            merged.append(chunks[i])
+            i += 1
+    chunks = merged
 
     print(f"  Text split into {len(chunks)} chunks")
 
