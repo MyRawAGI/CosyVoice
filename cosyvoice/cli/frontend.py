@@ -14,13 +14,17 @@
 from functools import partial
 from typing import Generator
 import json
+import os
+import sys
+
+# NOTE: DLL preload for onnxruntime-gpu on Windows is handled by the caller
+# (novel_tts.py) before this module is imported. No-op if already done.
 import onnxruntime
 import torch
 import numpy as np
 import whisper
 from typing import Callable
 import torchaudio.compliance.kaldi as kaldi
-import os
 import re
 import inflect
 from cosyvoice.utils.file_utils import logging, load_wav
@@ -43,9 +47,14 @@ class CosyVoiceFrontEnd:
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
-        self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
-                                                                     providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
-                                                                                "CPUExecutionProvider"])
+        try:
+            self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
+                                                                         providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+            logging.info("speech_tokenizer using CUDAExecutionProvider")
+        except Exception:
+            self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
+                                                                         providers=["CPUExecutionProvider"])
+            logging.info("speech_tokenizer using CPUExecutionProvider (CUDA unavailable)")
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device, weights_only=True)
         else:

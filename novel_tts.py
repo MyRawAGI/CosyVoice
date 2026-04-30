@@ -4,6 +4,20 @@ Markdown → Opus audiobooks with llama.cpp backend, progress tracking, and resu
 """
 
 import os
+import sys
+
+# Windows: add PyTorch lib dir to PATH before any other imports so that
+# onnxruntime-gpu can find cuDNN/CUBLAS DLLs that ship with torch.
+if sys.platform == 'win32':
+    try:
+        import torch as _torch_pre
+        _torch_lib = os.path.join(os.path.dirname(_torch_pre.__file__), 'lib')
+        if os.path.isdir(_torch_lib):
+            os.add_dll_directory(_torch_lib)
+            os.environ['PATH'] = _torch_lib + os.pathsep + os.environ.get('PATH', '')
+    except Exception:
+        pass
+
 import gc
 import re
 import json
@@ -11,7 +25,8 @@ import argparse
 import subprocess
 import tempfile
 import time
-import sys
+import shutil
+import wave
 import torch
 import torchaudio
 from markdown import markdown
@@ -45,7 +60,9 @@ def md_to_clean_text(md_content):
     text = re.sub(r'[\*#_~`]', '', text)
     text = re.sub(r'[«»<<>>""'']', '"', text)
     text = re.sub(r'\n\s*\n', '\n\n', text)
-    text = re.sub(r'\s+', ' ', text)
+    # Collapse spaces/tabs within lines but preserve newlines
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
     return text.strip()
 
 
@@ -59,8 +76,10 @@ def load_progress(output_dir):
 
 def save_progress(output_dir, progress):
     path = os.path.join(output_dir, 'progress.json')
-    with open(path, 'w', encoding='utf-8') as f:
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
         json.dump(progress, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
 
 
 def trim_ref_audio(ref_wav_path, max_sec=30):
@@ -92,14 +111,37 @@ def crossfade_merge(chunks, sr=22050, crossfade_ms=30):
     return torch.cat(merged, dim=-1)
 
 
-def concat_wavs_ffmpeg(wav_files, output_path):
-    list_path = output_path + '.list.txt'
-    with open(list_path, 'w', encoding='utf-8') as f:
+def load_and_merge_wavs(wav_files, output_path, sr=22050, crossfade_ms=30):
+    """Merge WAV files with crossfade, streaming output to avoid loading all into RAM."""
+    crossfade_samples = int(sr * crossfade_ms / 1000)
+    with wave.open(output_path, 'wb') as out_wav:
+        out_wav.setnchannels(1)
+        out_wav.setsampwidth(2)
+        out_wav.setframerate(sr)
+        pending = None
         for wf in wav_files:
-            f.write(f"file '{os.path.abspath(wf)}'\n")
-    cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c', 'copy', output_path]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    os.remove(list_path)
+            wav, file_sr = torchaudio.load(wf)
+            if file_sr != sr:
+                wav = torchaudio.functional.resample(wav, file_sr, sr)
+            if wav.shape[0] > 1:
+                wav = wav.mean(0, keepdim=True)
+            if pending is None:
+                pending = wav
+                continue
+            if pending.shape[-1] >= crossfade_samples and wav.shape[-1] >= crossfade_samples:
+                fade_out = torch.linspace(1.0, 0.0, crossfade_samples)
+                fade_in  = torch.linspace(0.0, 1.0, crossfade_samples)
+                overlap  = pending[..., -crossfade_samples:] * fade_out + wav[..., :crossfade_samples] * fade_in
+                write_part = torch.cat([pending[..., :-crossfade_samples], overlap], dim=-1)
+                pending = wav[..., crossfade_samples:]
+            else:
+                write_part = pending
+                pending = wav
+            pcm = (write_part.squeeze(0) * 32767).clamp(-32768, 32767).to(torch.int16)
+            out_wav.writeframes(pcm.numpy().tobytes())
+        if pending is not None and pending.shape[-1] > 0:
+            pcm = (pending.squeeze(0) * 32767).clamp(-32768, 32767).to(torch.int16)
+            out_wav.writeframes(pcm.numpy().tobytes())
 
 
 def wav_to_opus(wav_path, opus_path, bitrate=48):
@@ -121,7 +163,9 @@ def synthesize_chunk(cosyvoice, text, ref_text, ref_wav, max_retries=3):
                 prompt_text=ref_text,
                 prompt_wav=ref_wav,
             ):
-                audio_chunks.append(output['tts_speech'])
+                # Move to CPU immediately to free VRAM before next yield
+                audio_chunks.append(output['tts_speech'].cpu())
+                torch.cuda.empty_cache()
 
             if audio_chunks:
                 return crossfade_merge(audio_chunks)
@@ -134,6 +178,7 @@ def synthesize_chunk(cosyvoice, text, ref_text, ref_wav, max_retries=3):
         except Exception as e:
             print(f"    Error: {e}, retry {attempt+1}/{max_retries}")
             time.sleep(1)
+    print(f"    All {max_retries} retries exhausted, skipping chunk")
     return None
 
 
@@ -239,11 +284,11 @@ def process_file(cosyvoice, md_path, output_dir, ref_text, ref_wav, bitrate, pro
             temp_wavs.append(tp)
 
     failed_chunks = []
-    for i in range(start_chunk, len(chunks)):
+    for i in tqdm(range(start_chunk, len(chunks)), initial=start_chunk, total=len(chunks), desc="  Chunks", unit="chunk"):
         chunk_text = chunks[i]
         temp_path = os.path.join(temp_dir, f"chunk_{i:05d}.wav")
 
-        print(f"  Chunk {i+1}/{len(chunks)} ({len(chunk_text)} chars): {chunk_text[:60]}...")
+        tqdm.write(f"  Chunk {i+1}/{len(chunks)} ({len(chunk_text)} chars): {chunk_text[:60]}...")
         t0 = time.time()
 
         audio = synthesize_chunk(cosyvoice, chunk_text, ref_text, ref_wav)
@@ -251,10 +296,10 @@ def process_file(cosyvoice, md_path, output_dir, ref_text, ref_wav, bitrate, pro
             torchaudio.save(temp_path, audio, cosyvoice.sample_rate)
             temp_wavs.append(temp_path)
             dur = audio.shape[-1] / cosyvoice.sample_rate
-            print(f"    Done: {dur:.1f}s in {time.time()-t0:.1f}s")
+            tqdm.write(f"    Done: {dur:.1f}s in {time.time()-t0:.1f}s")
         else:
             failed_chunks.append(i)
-            print(f"    FAILED — no audio generated")
+            tqdm.write(f"    FAILED — no audio generated")
 
         # Update progress after each chunk
         progress[file_key]['next_chunk'] = i + 1
@@ -272,10 +317,9 @@ def process_file(cosyvoice, md_path, output_dir, ref_text, ref_wav, bitrate, pro
     # Concatenate all chunks
     print(f"  Concatenating {len(temp_wavs)} chunks...")
     if len(temp_wavs) == 1:
-        import shutil
         shutil.copy2(temp_wavs[0], final_wav)
     else:
-        concat_wavs_ffmpeg(temp_wavs, final_wav)
+        load_and_merge_wavs(temp_wavs, final_wav, sr=cosyvoice.sample_rate)
 
     # Convert to opus
     print(f"  Converting to opus ({bitrate}kbps)...")
@@ -283,8 +327,11 @@ def process_file(cosyvoice, md_path, output_dir, ref_text, ref_wav, bitrate, pro
 
     # Stats
     wav_mb = os.path.getsize(final_wav) / (1024 * 1024)
-    opus_mb = os.path.getsize(final_opus) / (1024 * 1024)
-    print(f"  Result: WAV {wav_mb:.1f}MB → Opus {opus_mb:.1f}MB")
+    if os.path.exists(final_opus) and os.path.getsize(final_opus) > 0:
+        opus_mb = os.path.getsize(final_opus) / (1024 * 1024)
+        print(f"  Result: WAV {wav_mb:.1f}MB → Opus {opus_mb:.1f}MB")
+    else:
+        print(f"  WARNING: Opus conversion failed, keeping WAV: {final_wav}")
 
     # Cleanup temp
     for f in temp_wavs:
@@ -297,11 +344,12 @@ def process_file(cosyvoice, md_path, output_dir, ref_text, ref_wav, bitrate, pro
     except:
         pass
 
-    # Remove intermediate WAV
-    try:
-        os.remove(final_wav)
-    except:
-        pass
+    # Remove intermediate WAV only after confirmed successful opus conversion
+    if os.path.exists(final_opus) and os.path.getsize(final_opus) > 0:
+        try:
+            os.remove(final_wav)
+        except:
+            pass
 
     if failed_chunks:
         print(f"  WARNING: {len(failed_chunks)} chunks failed: {failed_chunks}")
@@ -355,51 +403,59 @@ def main():
     # Prepare ref audio
     print(f"Preparing ref audio: {args.ref_wav}")
     ref_wav = trim_ref_audio(args.ref_wav, max_sec=22)
+    ref_wav_is_temp = (ref_wav != args.ref_wav)
 
-    # Load model
-    print(f"Loading CosyVoice model...")
-    sys.path.insert(0, SCRIPT_DIR)
-    from cosyvoice.cli.cosyvoice import AutoModel
+    try:
+        # Load model
+        print(f"Loading CosyVoice model...")
+        sys.path.insert(0, SCRIPT_DIR)
+        from cosyvoice.cli.cosyvoice import AutoModel
 
-    t0 = time.time()
-    cosyvoice = AutoModel(
-        model_dir=args.model_dir,
-        load_llama_cpp=True,
-        gguf_model_path=args.gguf,
-    )
-    print(f"Model loaded in {time.time()-t0:.1f}s\n")
+        t0 = time.time()
+        cosyvoice = AutoModel(
+            model_dir=args.model_dir,
+            load_llama_cpp=True,
+            gguf_model_path=args.gguf,
+        )
+        print(f"Model loaded in {time.time()-t0:.1f}s\n")
 
-    # Process files
-    print(f"Found {len(md_files)} .md files\n")
-    for md_file in md_files:
-        file_key = md_file
-        file_state = progress.get(file_key, {})
+        # Process files
+        print(f"Found {len(md_files)} .md files\n")
+        for md_file in md_files:
+            file_key = md_file
+            file_state = progress.get(file_key, {})
 
-        if file_state.get('status') == 'done' and not args.no_resume:
-            print(f"[SKIP] {md_file} — already done")
-            continue
+            if file_state.get('status') == 'done' and not args.no_resume:
+                print(f"[SKIP] {md_file} — already done")
+                continue
 
-        print(f"{'='*60}")
-        print(f"Processing: {md_file}")
-        md_path = os.path.join(args.novel_dir, md_file)
+            print(f"{'='*60}")
+            print(f"Processing: {md_file}")
+            md_path = os.path.join(args.novel_dir, md_file)
 
-        try:
-            process_file(
-                cosyvoice=cosyvoice,
-                md_path=md_path,
-                output_dir=args.output_dir,
-                ref_text=args.ref_text,
-                ref_wav=ref_wav,
-                bitrate=args.bitrate,
-                progress=progress,
-                file_key=file_key,
-            )
-        except Exception as e:
-            print(f"  FATAL: {e}")
-            import traceback
-            traceback.print_exc()
+            try:
+                process_file(
+                    cosyvoice=cosyvoice,
+                    md_path=md_path,
+                    output_dir=args.output_dir,
+                    ref_text=args.ref_text,
+                    ref_wav=ref_wav,
+                    bitrate=args.bitrate,
+                    progress=progress,
+                    file_key=file_key,
+                )
+            except Exception as e:
+                print(f"  FATAL: {e}")
+                import traceback
+                traceback.print_exc()
 
-        print()
+            print()
+    finally:
+        if ref_wav_is_temp:
+            try:
+                os.remove(ref_wav)
+            except:
+                pass
 
     print("All done.")
 
